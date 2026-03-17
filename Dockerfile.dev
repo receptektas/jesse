@@ -1,0 +1,30 @@
+FROM python:3.11-slim-bullseye
+ENV PYTHONUNBUFFERED=1
+
+RUN apt-get update \
+    && apt-get -y install git build-essential libssl-dev \
+    && apt-get clean \
+    && pip install --upgrade pip
+
+RUN pip3 install Cython numpy
+
+WORKDIR /jesse-docker
+
+# Bağımlılıkları image'a yükle
+COPY requirements.txt /jesse-docker/
+RUN pip3 install -r requirements.txt
+
+# Editable install için minimum dosyalar
+# (Gerçek kaynak kod docker-compose volume ile /jesse-docker'a mount edilir)
+COPY setup.py README.md /jesse-docker/
+COPY MANIFEST.in /jesse-docker/
+COPY jesse/__init__.py /jesse-docker/jesse/__init__.py
+COPY jesse/version.py /jesse-docker/jesse/version.py
+RUN pip3 install -e .
+
+RUN pip3 install watchdog
+
+COPY entrypoint.dev.sh /entrypoint.dev.sh
+RUN chmod +x /entrypoint.dev.sh
+
+ENTRYPOINT ["/entrypoint.dev.sh"]

@@ -25,6 +25,8 @@ _active_form_config: dict | None = None
 
 
 def _load_preset(config_name: str) -> dict | None:
+    if config_name.endswith('.json'):
+        config_name = config_name[:-5]
     config_path = os.path.join('backtest-configs', f'{config_name}.json')
     if not os.path.exists(config_path):
         print(f'[WARN] Backtest config not found: {config_path}')
@@ -60,9 +62,12 @@ def _apply_exchange_settings(preset: dict, config_name: str) -> None:
         o = Option.get(Option.type == 'config')
         db_config = json.loads(o.json)
 
+        exchanges = db_config.get('backtest', {}).get('exchanges', {})
         for exchange_name, settings in preset.get('exchange_settings', {}).items():
-            if exchange_name in db_config.get('backtest', {}).get('exchanges', {}):
-                db_config['backtest']['exchanges'][exchange_name].update(settings)
+            if exchange_name in exchanges:
+                exchanges[exchange_name].update(settings)
+            else:
+                print(f'[PRESET] Skipping "{exchange_name}" — not found in DB config')
 
         if 'warm_up_candles' in preset:
             db_config['backtest']['warm_up_candles'] = preset['warm_up_candles']

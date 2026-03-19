@@ -1,8 +1,10 @@
 import json
 import os
+import urllib.parse
 import warnings
 from contextlib import asynccontextmanager
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from jesse.services.web import fastapi_app
 import jesse.helpers as jh
@@ -25,17 +27,20 @@ def _apply_active_backtest_config():
     global _active_form_config
 
     active_config_file = '.active-backtest-config'
+    print(f'[PRESET] Looking for active config file: {active_config_file}')
     if not os.path.exists(active_config_file):
         return
 
     config_name = open(active_config_file).read().strip()
     if not config_name:
         return
+    print(f'[PRESET] Found config name: {config_name}')
 
     config_path = os.path.join('backtest-configs', f'{config_name}.json')
     if not os.path.exists(config_path):
         print(f'[WARN] Backtest config not found: {config_path}')
         return
+    print(f'[PRESET] Loading preset from: {config_path}')
 
     with open(config_path) as f:
         preset = json.load(f)
@@ -61,15 +66,15 @@ def _apply_active_backtest_config():
             o.json = json.dumps(db_config)
             o.updated_at = jh.now(True)
             o.save()
-            print(f'[INFO] Applied backtest config "{config_name}" to DB.')
+            print(f'[PRESET] DB update success: exchange_settings applied for "{config_name}"')
         except peewee.DoesNotExist:
-            print(f'[INFO] No DB config record yet; skipping DB update for preset "{config_name}".')
+            print(f'[PRESET] DB record not found yet — exchange settings will apply after first UI save')
         finally:
             database.close_connection()
     except Exception as e:
         print(f'[WARN] Could not update DB config from preset: {e}')
 
-    # Store form config for HTML injection
+    # Store form config for cookie injection
     _active_form_config = {
         'routes': preset.get('routes', []),
         'extra_routes': preset.get('extra_routes', []),
@@ -81,6 +86,7 @@ def _apply_active_backtest_config():
         'export_csv': preset.get('export_csv', False),
         'export_json': preset.get('export_json', False),
         'export_full_reports': preset.get('export_full_reports', False),
+        'warm_up_candles': preset.get('warm_up_candles', 210),
     }
 
 
@@ -98,12 +104,44 @@ fastapi_app.router.lifespan_context = lifespan
 
 # load homepage
 @fastapi_app.get("/")
-async def index():
+async def index(request: Request):
     html = open(f"{JESSE_DIR}/static/index.html").read()
-    if _active_form_config:
-        script = f'<script>localStorage.setItem("backtestForm",{json.dumps(_active_form_config)});</script>'
-        html = html.replace("</head>", f"{script}\n</head>", 1)
-    return HTMLResponse(content=html)
+
+    if _active_form_config is None:
+        return HTMLResponse(content=html)
+
+    # Merge preset into Pinia's "backtest" cookie so $patch fills the form on load
+    existing_raw = request.cookies.get("backtest")
+    try:
+        existing = json.loads(urllib.parse.unquote(existing_raw)) if existing_raw else {}
+    except Exception:
+        existing = {}
+
+    tabs = existing.get("tabs", [{}])
+    if not tabs:
+        tabs = [{}]
+
+    tab = tabs[0]
+    tab["form"] = {**tab.get("form", {}), **_active_form_config}
+    tabs[0] = tab
+    existing["tabs"] = tabs
+
+    cookie_value = urllib.parse.quote(json.dumps(existing, separators=(',', ':')))
+
+    response = HTMLResponse(content=html)
+    response.set_cookie(
+        key="backtest",
+        value=cookie_value,
+        path="/",
+        samesite="lax",
+        httponly=False,
+    )
+    return response
+
+
+@fastapi_app.get("/api/active-preset")
+async def active_preset():
+    return JSONResponse(_active_form_config or {})
 
 
 

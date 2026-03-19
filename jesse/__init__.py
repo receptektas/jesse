@@ -1,9 +1,7 @@
 import json
 import os
-import urllib.parse
 import warnings
 from contextlib import asynccontextmanager
-from fastapi import Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from jesse.services.web import fastapi_app
@@ -45,37 +43,7 @@ def _apply_active_backtest_config():
     with open(config_path) as f:
         preset = json.load(f)
 
-    # Update exchange settings and warm_up_candles in DB
-    try:
-        import peewee
-        from jesse.services.db import database
-        from jesse.models.Option import Option
-
-        database.open_connection()
-        try:
-            o = Option.get(Option.type == 'config')
-            db_config = json.loads(o.json)
-
-            for exchange_name, settings in preset.get('exchange_settings', {}).items():
-                if exchange_name in db_config.get('backtest', {}).get('exchanges', {}):
-                    db_config['backtest']['exchanges'][exchange_name].update(settings)
-
-            if 'warm_up_candles' in preset:
-                db_config['backtest']['warm_up_candles'] = preset['warm_up_candles']
-
-            o.json = json.dumps(db_config)
-            o.updated_at = jh.now(True)
-            o.save()
-            print(f'[PRESET] DB update success: exchange_settings applied for "{config_name}"')
-        except peewee.DoesNotExist:
-            print(f'[PRESET] DB record not found yet — exchange settings will apply after first UI save')
-        finally:
-            database.close_connection()
-    except Exception as e:
-        print(f'[WARN] Could not update DB config from preset: {e}')
-
-    # Store form config for cookie injection
-    _active_form_config = {
+    form_config = {
         'routes': preset.get('routes', []),
         'extra_routes': preset.get('extra_routes', []),
         'start_date': preset.get('start_date', ''),
@@ -88,6 +56,51 @@ def _apply_active_backtest_config():
         'export_full_reports': preset.get('export_full_reports', False),
         'warm_up_candles': preset.get('warm_up_candles', 210),
     }
+
+    # Update DB: exchange settings (Option) + all BacktestSession state.form fields
+    try:
+        import peewee
+        from jesse.services.db import database
+        from jesse.models.Option import Option
+        from jesse.models.BacktestSession import BacktestSession
+
+        database.open_connection()
+        try:
+            # 1. Update exchange settings in Option config
+            try:
+                o = Option.get(Option.type == 'config')
+                db_config = json.loads(o.json)
+
+                for exchange_name, settings in preset.get('exchange_settings', {}).items():
+                    if exchange_name in db_config.get('backtest', {}).get('exchanges', {}):
+                        db_config['backtest']['exchanges'][exchange_name].update(settings)
+
+                if 'warm_up_candles' in preset:
+                    db_config['backtest']['warm_up_candles'] = preset['warm_up_candles']
+
+                o.json = json.dumps(db_config)
+                o.updated_at = jh.now(True)
+                o.save()
+                print(f'[PRESET] DB update success: exchange_settings applied for "{config_name}"')
+            except peewee.DoesNotExist:
+                print(f'[PRESET] DB record not found yet — exchange settings will apply after first UI save')
+
+            # 2. Update all BacktestSession records: merge preset into state.form
+            sessions = list(BacktestSession.select())
+            for session in sessions:
+                existing_state = json.loads(session.state) if session.state else {}
+                existing_state['form'] = {**existing_state.get('form', {}), **form_config}
+                BacktestSession.update(
+                    state=json.dumps(existing_state),
+                    updated_at=jh.now_to_timestamp(True)
+                ).where(BacktestSession.id == session.id).execute()
+            print(f'[PRESET] Updated {len(sessions)} backtest session(s) with form config')
+        finally:
+            database.close_connection()
+    except Exception as e:
+        print(f'[WARN] Could not update DB from preset: {e}')
+
+    _active_form_config = form_config
 
 
 # define lifespan (replaces deprecated @on_event("shutdown"))
@@ -104,39 +117,8 @@ fastapi_app.router.lifespan_context = lifespan
 
 # load homepage
 @fastapi_app.get("/")
-async def index(request: Request):
-    html = open(f"{JESSE_DIR}/static/index.html").read()
-
-    if _active_form_config is None:
-        return HTMLResponse(content=html)
-
-    # Merge preset into Pinia's "backtest" cookie so $patch fills the form on load
-    existing_raw = request.cookies.get("backtest")
-    try:
-        existing = json.loads(urllib.parse.unquote(existing_raw)) if existing_raw else {}
-    except Exception:
-        existing = {}
-
-    tabs = existing.get("tabs", [{}])
-    if not tabs:
-        tabs = [{}]
-
-    tab = tabs[0]
-    tab["form"] = {**tab.get("form", {}), **_active_form_config}
-    tabs[0] = tab
-    existing["tabs"] = tabs
-
-    cookie_value = urllib.parse.quote(json.dumps(existing, separators=(',', ':')))
-
-    response = HTMLResponse(content=html)
-    response.set_cookie(
-        key="backtest",
-        value=cookie_value,
-        path="/",
-        samesite="lax",
-        httponly=False,
-    )
-    return response
+async def index():
+    return HTMLResponse(content=open(f"{JESSE_DIR}/static/index.html").read())
 
 
 @fastapi_app.get("/api/active-preset")

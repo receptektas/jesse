@@ -40,6 +40,8 @@ def _build_form_config(preset: dict) -> dict:
         'extra_routes': preset.get('extra_routes', []),
         'start_date': preset.get('start_date', ''),
         'finish_date': preset.get('finish_date', ''),
+        'fast_mode': preset.get('fast_mode', False),
+        'benchmark': preset.get('benchmark', False),
         'debug_mode': preset.get('debug_mode', False),
         'export_chart': preset.get('export_chart', False),
         'export_tradingview': preset.get('export_tradingview', False),

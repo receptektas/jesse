@@ -2,7 +2,7 @@ import json
 import os
 import warnings
 from contextlib import asynccontextmanager
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from jesse.services.web import fastapi_app
 import jesse.helpers as jh
@@ -11,39 +11,31 @@ import jesse.helpers as jh
 from jesse.cli import cli
 
 
-# to silent stupid pandas warnings
+# Suppress pandas FutureWarnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # get the jesse directory
 JESSE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# holds the form config to inject into index.html (set at startup)
-_active_form_config = None
+ACTIVE_CONFIG_FILE = '.active-backtest-config'
+DEFAULT_WARM_UP_CANDLES = 210
+
+# Active preset form config — populated at startup, served via /api/active-preset
+_active_form_config: dict | None = None
 
 
-def _apply_active_backtest_config():
-    global _active_form_config
-
-    active_config_file = '.active-backtest-config'
-    print(f'[PRESET] Looking for active config file: {active_config_file}')
-    if not os.path.exists(active_config_file):
-        return
-
-    config_name = open(active_config_file).read().strip()
-    if not config_name:
-        return
-    print(f'[PRESET] Found config name: {config_name}')
-
+def _load_preset(config_name: str) -> dict | None:
     config_path = os.path.join('backtest-configs', f'{config_name}.json')
     if not os.path.exists(config_path):
         print(f'[WARN] Backtest config not found: {config_path}')
-        return
+        return None
     print(f'[PRESET] Loading preset from: {config_path}')
-
     with open(config_path) as f:
-        preset = json.load(f)
+        return json.load(f)
 
-    form_config = {
+
+def _build_form_config(preset: dict) -> dict:
+    return {
         'routes': preset.get('routes', []),
         'extra_routes': preset.get('extra_routes', []),
         'start_date': preset.get('start_date', ''),
@@ -54,51 +46,77 @@ def _apply_active_backtest_config():
         'export_csv': preset.get('export_csv', False),
         'export_json': preset.get('export_json', False),
         'export_full_reports': preset.get('export_full_reports', False),
-        'warm_up_candles': preset.get('warm_up_candles', 210),
+        'warm_up_candles': preset.get('warm_up_candles', DEFAULT_WARM_UP_CANDLES),
     }
 
-    # Update DB: exchange settings (Option) + all BacktestSession state.form fields
+
+def _apply_exchange_settings(preset: dict, config_name: str) -> None:
+    import peewee
+    from jesse.models.Option import Option
+
     try:
-        import peewee
-        from jesse.services.db import database
-        from jesse.models.Option import Option
-        from jesse.models.BacktestSession import BacktestSession
+        o = Option.get(Option.type == 'config')
+        db_config = json.loads(o.json)
 
-        database.open_connection()
-        try:
-            # 1. Update exchange settings in Option config
-            try:
-                o = Option.get(Option.type == 'config')
-                db_config = json.loads(o.json)
+        for exchange_name, settings in preset.get('exchange_settings', {}).items():
+            if exchange_name in db_config.get('backtest', {}).get('exchanges', {}):
+                db_config['backtest']['exchanges'][exchange_name].update(settings)
 
-                for exchange_name, settings in preset.get('exchange_settings', {}).items():
-                    if exchange_name in db_config.get('backtest', {}).get('exchanges', {}):
-                        db_config['backtest']['exchanges'][exchange_name].update(settings)
+        if 'warm_up_candles' in preset:
+            db_config['backtest']['warm_up_candles'] = preset['warm_up_candles']
 
-                if 'warm_up_candles' in preset:
-                    db_config['backtest']['warm_up_candles'] = preset['warm_up_candles']
+        o.json = json.dumps(db_config)
+        o.updated_at = jh.now(True)
+        o.save()
+        print(f'[PRESET] Exchange settings applied for "{config_name}"')
+    except peewee.DoesNotExist:
+        print(f'[PRESET] DB record not found yet — exchange settings will apply after first UI save')
 
-                o.json = json.dumps(db_config)
-                o.updated_at = jh.now(True)
-                o.save()
-                print(f'[PRESET] DB update success: exchange_settings applied for "{config_name}"')
-            except peewee.DoesNotExist:
-                print(f'[PRESET] DB record not found yet — exchange settings will apply after first UI save')
 
-            # 2. Update all BacktestSession records: merge preset into state.form
-            sessions = list(BacktestSession.select())
-            for session in sessions:
-                existing_state = json.loads(session.state) if session.state else {}
-                existing_state['form'] = {**existing_state.get('form', {}), **form_config}
-                BacktestSession.update(
-                    state=json.dumps(existing_state),
-                    updated_at=jh.now_to_timestamp(True)
-                ).where(BacktestSession.id == session.id).execute()
-            print(f'[PRESET] Updated {len(sessions)} backtest session(s) with form config')
-        finally:
-            database.close_connection()
+def _apply_form_config_to_sessions(form_config: dict) -> None:
+    from jesse.models.BacktestSession import BacktestSession
+
+    sessions = list(BacktestSession.select())
+    for session in sessions:
+        existing_state = json.loads(session.state) if session.state else {}
+        existing_state['form'] = {**existing_state.get('form', {}), **form_config}
+        BacktestSession.update(
+            state=json.dumps(existing_state),
+            updated_at=jh.now_to_timestamp(True)
+        ).where(BacktestSession.id == session.id).execute()
+    print(f'[PRESET] Updated {len(sessions)} backtest session(s) with form config')
+
+
+def _apply_active_backtest_config() -> None:
+    global _active_form_config
+
+    if not os.path.exists(ACTIVE_CONFIG_FILE):
+        print(f'[PRESET] No active config file found')
+        return
+
+    with open(ACTIVE_CONFIG_FILE) as f:
+        config_name = f.read().strip()
+
+    if not config_name:
+        return
+
+    print(f'[PRESET] Active config: {config_name}')
+
+    preset = _load_preset(config_name)
+    if preset is None:
+        return
+
+    form_config = _build_form_config(preset)
+
+    from jesse.services.db import database
+    database.open_connection()
+    try:
+        _apply_exchange_settings(preset, config_name)
+        _apply_form_config_to_sessions(form_config)
     except Exception as e:
         print(f'[WARN] Could not update DB from preset: {e}')
+    finally:
+        database.close_connection()
 
     _active_form_config = form_config
 
@@ -124,10 +142,6 @@ async def index():
 @fastapi_app.get("/api/active-preset")
 async def active_preset():
     return JSONResponse(_active_form_config or {})
-
-
-
-
 
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # #

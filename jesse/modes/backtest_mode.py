@@ -15,6 +15,7 @@ from jesse.services import charts
 from jesse.services import report
 from jesse.services import candle_service
 from jesse.services.file import store_logs
+from jesse.services import strategy_report as sr
 from jesse.services.validators import validate_routes
 from jesse.store import store
 from jesse.services import logger
@@ -899,8 +900,37 @@ def _generate_outputs(
         result["hyperparameters"] = stats.hyperparameters(router.routes)
     result["metrics"] = report.portfolio_metrics()
     result["trades"] = report.trades()
+
+    # compute strategy_report for JSON export
+    strategy_report_data = None
+    if generate_json and store.closed_trades.count > 0:
+        try:
+            primary = router.routes[0]
+            tf_seconds = TIMEFRAME_TO_ONE_MINUTES.get(primary.timeframe, 1) * 60
+
+            candle_key = f"{primary.exchange}-{primary.symbol}"
+            candles_data = candles.get(candle_key, {}).get("candles")
+            first_price = float(candles_data[0][2]) if candles_data is not None and len(candles_data) > 0 else None
+            last_price = float(candles_data[-1][2]) if candles_data is not None and len(candles_data) > 0 else None
+
+            starting_balance = 0
+            for e in store.exchanges.storage:
+                starting_balance += store.exchanges.storage[e].starting_assets[jh.app_currency()]
+
+            strategy_report_data = sr.compute(
+                trades_list=[t.to_json for t in store.closed_trades.trades],
+                daily_balance=store.app.daily_balance,
+                starting_balance=starting_balance,
+                existing_metrics=result["metrics"],
+                timeframe_seconds=tf_seconds,
+                first_price=first_price,
+                last_price=last_price,
+            )
+        except Exception:
+            pass
+
     # generate logs in json, csv and tradingview's pine-editor format
-    logs_path = store_logs(generate_json, generate_tradingview, generate_csv)
+    logs_path = store_logs(generate_json, generate_tradingview, generate_csv, strategy_report=strategy_report_data)
     if generate_json:
         result["json"] = logs_path["json"]
     if generate_tradingview:

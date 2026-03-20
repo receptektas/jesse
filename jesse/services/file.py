@@ -10,7 +10,7 @@ from jesse.store import store
 import jesse.helpers as jh
 
 
-def store_logs(export_json: bool = False, export_tradingview: bool = False, export_csv: bool = False) -> dict:
+def store_logs(export_json: bool = False, export_tradingview: bool = False, export_csv: bool = False, strategy_report: dict = None) -> dict:
     if store.closed_trades.count == 0:
         return {
             'json': None,
@@ -26,6 +26,9 @@ def store_logs(export_json: bool = False, export_tradingview: bool = False, expo
 
     if export_json:
         path = f'storage/json/{file_name}.json'
+
+        if strategy_report is not None:
+            trades_json['strategy_report'] = strategy_report
 
         os.makedirs('./storage/json', exist_ok=True)
         with open(path, 'w+') as outfile:
